@@ -1,0 +1,5 @@
+*.csr
+*.json
+*.pem
+*.sig
+Containerfile

@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+    echo "> $*"
+}
+
+readonly TOOLS="
+    cfssl
+    cfssljson
+    cosign
+    openssl
+    podman
+"
+
+for TOOL in $TOOLS; do
+    if ! command -v "$TOOL" &>/dev/null; then
+        log "Missing tool: $TOOL"
+        exit 1
+    fi
+done
+
+log "Preparing certificate chain"
+
+CA_CONFIG=ca-config.json
+tee $CA_CONFIG 1>/dev/null <<-CONFIG
+	{
+		"signing": {
+			"default": {
+				"expiry": "8760h"
+			},
+			"profiles": {
+				"server": {
+					"expiry": "43800h",
+					"usages": [
+						"signing",
+						"key encipherment",
+						"server auth"
+					]
+				},
+				"client": {
+					"expiry": "43800h",
+					"usages": [
+						"signing",
+						"key encipherment",
+						"client auth"
+					]
+				},
+				"client-server": {
+					"expiry": "43800h",
+					"usages": [
+						"signing",
+						"key encipherment",
+						"server auth",
+						"client auth"
+					]
+				}
+			}
+		}
+	}
+CONFIG
+
+CA_INTERMEDIATE_CONFIG=ca-root-to-intermediate-config.json
+tee $CA_INTERMEDIATE_CONFIG 1>/dev/null <<-CONFIG
+	{
+		"signing": {
+			"default": {
+				"expiry": "43800h",
+				"ca_constraint": {
+					"is_ca": true,
+					"max_path_len": 0,
+					"max_path_len_zero": true
+				},
+				"usages": [
+					"digital signature",
+					"cert sign",
+					"crl sign",
+					"signing"
+				]
+			}
+		}
+	}
+CONFIG
+
+CA_ROOT_CERT="ca-root"
+cfssl genkey \
+    -initca \
+    - \
+    <<-CONFIG | cfssljson -bare $CA_ROOT_CERT
+		{
+			"CN": "(LOCAL) ROOT CA",
+			"key": {
+				"algo": "rsa",
+				"size": 2048
+			},
+			"names": [
+				{
+					"C": "--",
+					"ST": "STATE",
+					"L": "LOCALITY",
+					"O": "ORGANISATION",
+					"OU": "LOCAL"
+				}
+			],
+			"ca": {
+				"expiry": "131400h"
+			}
+		}
+	CONFIG
+
+CA_INTERMEDIATE="ca-intermediate"
+cfssl gencert \
+    -initca \
+    - \
+    <<-CONFIG | cfssljson -bare $CA_INTERMEDIATE
+		{
+			"CN": "(LOCAL) CA",
+			"key": {
+				"algo": "rsa",
+				"size": 2048
+			},
+			"names": [
+				{
+					"C": "--",
+					"ST": "STATE",
+					"L": "LOCALITY",
+					"O": "ORGANISATION",
+					"OU": "LOCAL"
+				}
+			],
+			"ca": {
+				"expiry": "43800h"
+			}
+		}
+	CONFIG
+
+cfssl sign \
+    -ca $CA_ROOT_CERT.pem \
+    -ca-key $CA_ROOT_CERT-key.pem \
+    -config $CA_INTERMEDIATE_CONFIG \
+    $CA_INTERMEDIATE.csr |
+    cfssljson -bare $CA_INTERMEDIATE
+
+LEAF_CERT=localhost
+cfssl gencert \
+    -ca $CA_INTERMEDIATE.pem \
+    -ca-key $CA_INTERMEDIATE-key.pem \
+    -config $CA_CONFIG \
+    -profile server \
+    -hostname "localhost.localdomain,localhost" \
+    - \
+    <<-CONFIG | cfssljson -bare $LEAF_CERT
+		{
+			"CN": "localhost.localdomain",
+			"key": {
+				"algo": "rsa",
+				"size": 2048
+			}
+		}
+	CONFIG
+
+openssl rsa -in $LEAF_CERT-key.pem -outform PEM -pubout -out $LEAF_CERT-pubkey.pem
+CHAIN=chain
+cat $CA_ROOT_CERT.pem $CA_INTERMEDIATE.pem >$CHAIN.pem
+
+log "Starting registry"
+podman rm -f registry
+podman run --rm -d -p 5000:5000 --name registry registry:2
+
+log "Building and pushing demo image"
+IMAGE=localhost:5000/test
+echo "FROM scratch" >Containerfile
+podman build -t $IMAGE .
+podman push --tls-verify=false $IMAGE
+
+log "Generate payload"
+PAYLOAD=payload.json
+cosign generate $IMAGE >$PAYLOAD
+openssl dgst -sha256 -sign $LEAF_CERT-key.pem -out $PAYLOAD.sig $PAYLOAD
+cat $PAYLOAD.sig | base64 >$PAYLOAD.base64.sig
+
+log "Attach signature"
+cosign attach signature $IMAGE \
+    --payload $PAYLOAD \
+    --signature $PAYLOAD.base64.sig \
+    --cert $LEAF_CERT.pem \
+    --cert-chain $CHAIN.pem
+
+log "Verify signature"
+cosign verify \
+    --insecure-ignore-tlog=true \
+    --key $LEAF_CERT-pubkey.pem \
+    $IMAGE
