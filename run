@@ -173,6 +173,8 @@ echo "FROM scratch" >Containerfile
 podman build -t $IMAGE .
 podman push --tls-verify=false $IMAGE
 
+export COSIGN_EXPERIMENTAL=1
+
 log "Generate payload"
 PAYLOAD=payload.json
 cosign generate $IMAGE >$PAYLOAD
@@ -186,8 +188,16 @@ cosign attach signature $IMAGE \
     --cert $LEAF_CERT.pem \
     --cert-chain $CHAIN.pem
 
-log "Verify signature"
+log "Verify signature using key"
 cosign verify \
     --insecure-ignore-tlog=true \
     --key $LEAF_CERT-pubkey.pem \
+    $IMAGE
+
+log "Verify signature keyless"
+cosign verify \
+    --certificate-identity-regexp '.*' \
+    --certificate-oidc-issuer-regexp '.*' \
+    --insecure-ignore-tlog=true \
+    --cert-chain $CHAIN.pem \
     $IMAGE
