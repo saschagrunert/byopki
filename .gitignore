@@ -1,5 +1,8 @@
 *.csr
 *.json
+*.key
 *.pem
+*.pub
 *.sig
 Containerfile
+image-digest

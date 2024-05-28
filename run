@@ -9,7 +9,6 @@ readonly TOOLS="
     cfssl
     cfssljson
     cosign
-    openssl
     podman
 "
 
@@ -21,147 +20,150 @@ for TOOL in $TOOLS; do
 done
 
 log "Preparing certificate chain"
+cat <<EOF >root-csr.json
+{
+  "CN": "Root Certificate Authority",
+  "key": {
+    "algo": "ecdsa",
+    "size": 256
+  },
+  "names": [
+    {
+      "C": "--",
+      "ST": "STATE",
+      "L": "LOCALITY",
+      "O": "ORGANISATION",
+      "OU": "LOCAL"
+    }
+  ],
+  "ca": {
+    "expiry": "87600h"
+  }
+}
+EOF
 
-CA_CONFIG=ca-config.json
-tee $CA_CONFIG 1>/dev/null <<-CONFIG
-	{
-		"signing": {
-			"default": {
-				"expiry": "8760h"
-			},
-			"profiles": {
-				"server": {
-					"expiry": "43800h",
-					"usages": [
-						"signing",
-						"key encipherment",
-						"server auth"
-					]
-				},
-				"client": {
-					"expiry": "43800h",
-					"usages": [
-						"signing",
-						"key encipherment",
-						"client auth"
-					]
-				},
-				"client-server": {
-					"expiry": "43800h",
-					"usages": [
-						"signing",
-						"key encipherment",
-						"server auth",
-						"client auth"
-					]
-				}
-			}
-		}
-	}
-CONFIG
+cat <<EOF >intermediate-csr.json
+{
+  "CN": "Intermediate Certificate Authority",
+  "key": {
+    "algo": "ecdsa",
+    "size": 256
+  },
+  "names": [
+    {
+      "C": "--",
+      "ST": "STATE",
+      "L": "LOCALITY",
+      "O": "ORGANISATION",
+      "OU": "LOCAL"
+    }
+  ]
+}
+EOF
 
-CA_INTERMEDIATE_CONFIG=ca-root-to-intermediate-config.json
-tee $CA_INTERMEDIATE_CONFIG 1>/dev/null <<-CONFIG
-	{
-		"signing": {
-			"default": {
-				"expiry": "43800h",
-				"ca_constraint": {
-					"is_ca": true,
-					"max_path_len": 0,
-					"max_path_len_zero": true
-				},
-				"usages": [
-					"digital signature",
-					"cert sign",
-					"crl sign",
-					"signing"
-				]
-			}
-		}
-	}
-CONFIG
+log "Issuing root CA"
+cfssl gencert -initca root-csr.json | cfssljson -bare root
 
-CA_ROOT_CERT="ca-root"
-cfssl genkey \
-    -initca \
-    - \
-    <<-CONFIG | cfssljson -bare $CA_ROOT_CERT
-		{
-			"CN": "(LOCAL) ROOT CA",
-			"key": {
-				"algo": "rsa",
-				"size": 2048
-			},
-			"names": [
-				{
-					"C": "--",
-					"ST": "STATE",
-					"L": "LOCALITY",
-					"O": "ORGANISATION",
-					"OU": "LOCAL"
-				}
-			],
-			"ca": {
-				"expiry": "131400h"
-			}
-		}
-	CONFIG
+log "Generating intermediate CA"
+cfssl genkey intermediate-csr.json | cfssljson -bare intermediate
 
-CA_INTERMEDIATE="ca-intermediate"
-cfssl gencert \
-    -initca \
-    - \
-    <<-CONFIG | cfssljson -bare $CA_INTERMEDIATE
-		{
-			"CN": "(LOCAL) CA",
-			"key": {
-				"algo": "rsa",
-				"size": 2048
-			},
-			"names": [
-				{
-					"C": "--",
-					"ST": "STATE",
-					"L": "LOCALITY",
-					"O": "ORGANISATION",
-					"OU": "LOCAL"
-				}
-			],
-			"ca": {
-				"expiry": "43800h"
-			}
-		}
-	CONFIG
+cat <<EOF >ca-config.json
+{
+  "signing": {
+    "default": {
+      "expiry": "8760h"
+    },
+    "profiles": {
+      "intermediate": {
+        "usages": ["cert sign", "crl sign"],
+        "expiry": "70080h",
+        "ca_constraint": {
+          "is_ca": true,
+          "max_path_len": 1
+        }
+      }
+    }
+  }
+}
+EOF
 
+log "Issuing intermediate CA cert using root CA"
 cfssl sign \
-    -ca $CA_ROOT_CERT.pem \
-    -ca-key $CA_ROOT_CERT-key.pem \
-    -config $CA_INTERMEDIATE_CONFIG \
-    $CA_INTERMEDIATE.csr |
-    cfssljson -bare $CA_INTERMEDIATE
+    -ca root.pem \
+    -ca-key root-key.pem \
+    -config ca-config.json \
+    -profile intermediate \
+    intermediate.csr |
+    cfssljson -bare intermediate
 
-LEAF_CERT=localhost
+log "Building cosign certificate"
+cat <<EOF >cosign-config.json
+{
+  "signing": {
+    "default": {
+      "expiry": "8760h"
+    },
+    "profiles": {
+      "intermediate": {
+        "usages": ["cert sign", "crl sign"],
+        "expiry": "70080h",
+        "ca_constraint": {
+          "is_ca": true,
+          "max_path_len": 1,
+          "copy_extensions": true
+        }
+      },
+      "cosign": {
+        "usages": ["signing", "digital signing"],
+        "expiry": "8760h",
+        "copy_extensions": true
+      }
+    }
+  }
+}
+EOF
+
+OIDC_ISSUER=http://localhost
+OIDC_ISSUER_BASE64=$(echo -n $OIDC_ISSUER | base64 -w0)
+CERTIFICATE_IDENTITY=me@org
+
+# For extensions, see:
+# https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md#extension-values
+cat <<EOF >cosign-csr.json
+{
+  "CN": "Cosign Certificate",
+  "key": {
+    "algo": "ecdsa",
+    "size": 256
+  },
+  "names": [
+    {
+      "C": "--",
+      "ST": "STATE",
+      "L": "LOCALITY",
+      "O": "ORGANISATION",
+      "OU": "LOCAL"
+    }
+  ],
+  "hosts": [
+    "$CERTIFICATE_IDENTITY"
+  ],
+  "extensions": [
+    {
+        "id": [1,3,6,1,4,1,57264,1,1],
+        "value": "$OIDC_ISSUER_BASE64"
+    }
+  ]
+}
+EOF
+
+log "Issuing certificates via the intermediate CA"
 cfssl gencert \
-    -ca $CA_INTERMEDIATE.pem \
-    -ca-key $CA_INTERMEDIATE-key.pem \
-    -config $CA_CONFIG \
-    -profile server \
-    -hostname "localhost.localdomain,localhost" \
-    - \
-    <<-CONFIG | cfssljson -bare $LEAF_CERT
-		{
-			"CN": "localhost.localdomain",
-			"key": {
-				"algo": "rsa",
-				"size": 2048
-			}
-		}
-	CONFIG
-
-openssl rsa -in $LEAF_CERT-key.pem -outform PEM -pubout -out $LEAF_CERT-pubkey.pem
-CHAIN=chain
-cat $CA_ROOT_CERT.pem $CA_INTERMEDIATE.pem >$CHAIN.pem
+    -ca intermediate.pem \
+    -ca-key intermediate-key.pem \
+    -config cosign-config.json \
+    -profile cosign cosign-csr.json |
+    cfssljson -bare cosign
 
 log "Starting registry"
 podman rm -f registry
@@ -171,33 +173,29 @@ log "Building and pushing demo image"
 IMAGE=localhost:5000/test
 echo "FROM scratch" >Containerfile
 podman build -t $IMAGE .
-podman push --tls-verify=false $IMAGE
+podman push --tls-verify=false --digestfile image-digest $IMAGE
 
-export COSIGN_EXPERIMENTAL=1
+cat intermediate.pem root.pem >ca-bundle.pem
 
-log "Generate payload"
-PAYLOAD=payload.json
-cosign generate $IMAGE >$PAYLOAD
-openssl dgst -sha256 -sign $LEAF_CERT-key.pem -out $PAYLOAD.sig $PAYLOAD
-cat $PAYLOAD.sig | base64 >$PAYLOAD.base64.sig
+log "Signing image"
+DIGEST=$(cat image-digest)
+cosign import-key-pair \
+    --yes \
+    --key cosign-key.pem \
+    --output-key-prefix import-cosign
 
-log "Attach signature"
-cosign attach signature $IMAGE \
-    --payload $PAYLOAD \
-    --signature $PAYLOAD.base64.sig \
-    --cert $LEAF_CERT.pem \
-    --cert-chain $CHAIN.pem
+cosign sign \
+    --key import-cosign.key \
+    --tlog-upload=false \
+    --cert cosign.pem \
+    --cert-chain ca-bundle.pem \
+    "$IMAGE@$DIGEST"
 
-log "Verify signature using key"
+log "Verifying signature"
 cosign verify \
-    --insecure-ignore-tlog=true \
-    --key $LEAF_CERT-pubkey.pem \
-    $IMAGE
-
-log "Verify signature keyless"
-cosign verify \
-    --certificate-identity-regexp '.*' \
-    --certificate-oidc-issuer-regexp '.*' \
-    --insecure-ignore-tlog=true \
-    --cert-chain $CHAIN.pem \
-    $IMAGE
+    --certificate-identity $CERTIFICATE_IDENTITY \
+    --certificate-oidc-issuer $OIDC_ISSUER \
+    --insecure-ignore-sct \
+    --insecure-ignore-tlog \
+    --cert-chain root.pem \
+    "$IMAGE@$DIGEST"
